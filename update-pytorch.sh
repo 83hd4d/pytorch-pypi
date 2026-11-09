@@ -3,7 +3,6 @@
 [ -d gh-pages ] || git clone -q --branch gh-pages $(git config --get remote.origin.url) gh-pages
 cd gh-pages
 
-# Moved checkCount to the top so subshells can access it
 function checkCount() {
   local content="$1"
   local count="$2"
@@ -19,7 +18,6 @@ function checkCount() {
 function updateIndex() {
   local d=$1
 
-  # Wrapped in a subshell (...) so parallel executions don't conflict with 'cd' commands
   (
     mkdir -p $d/simple
     cd $d/simple
@@ -42,7 +40,8 @@ function updateIndex() {
         > index.html
 
       local pcount="$(cat index.html | grep -c 'https://download.pytorch.org/whl/')"
-      checkCount $d/$p $pcount 1
+      # Reverted to $count to match the original script's behavior for dependencies like certifi
+      checkCount $d/$p $count 1
       cd ..
     done
     echo "✅ Completed $d"
@@ -116,9 +115,8 @@ echo "Platforms found: $DYNAMIC_VERSIONS"
 PIDS=()
 for d in $DYNAMIC_VERSIONS
 do
-  # The '&' runs the function in the background
   updateIndex "whl/$d" & 
-  PIDS+=($!) # Save the process ID to track it
+  PIDS+=($!)
 done
 
 # 4. Wait for all background jobs to finish and ensure none failed
