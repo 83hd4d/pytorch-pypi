@@ -3,46 +3,7 @@
 [ -d gh-pages ] || git clone -q --branch gh-pages $(git config --get remote.origin.url) gh-pages
 cd gh-pages
 
-# update a PyPI index from PyTorch = https://download.pytorch.org/$d with d=whl or whl/<compute platform>
-# this copies the content (main url + follows links to projects) and does 2 updates:
-# 1. copies the content in a "simple/" sub-directory to match the convention from PEP 503 simple (that allows other APIs in parallel)
-# 2. updates the links to binary packages by adding "https://download.pytorch.org" prefix to PyTorch-provided "/whl/*" path to link back to PyTorch binaries in their home location
-function updateIndex() {
-  local d=$1
-
-  # will copy source $d to $d/simple
-  mkdir -p $d/simple
-  local dir="$(pwd)"
-  cd $d/simple
-
-  # projects list
-  curl -s https://download.pytorch.org/$d/ | grep -v 'TIMESTAMP 1' > index.html
-  local count="$(cat index.html | cut -d '>' -f 2 | cut -d '<' -f 1 | grep -cve '^\s*$')"
-
-  echo "https://download.pytorch.org/$d/ => $d/simple/"
-  checkCount $d $count 40
-
-  # copy also content of each project
-  local i=0
-  for p in `cat index.html | cut -d '>' -f 2 | cut -d '<' -f 1`
-  do
-    mkdir -p $p
-    cd $p
-    ((i++))
-    curl -s https://download.pytorch.org/$d/$p/ \
-      | sed -e 's_href="/whl_href="https://download.pytorch.org/whl_' \
-      | grep -v 'TIMESTAMP 1' \
-      > index.html
-
-    local pcount="$(cat index.html | grep -c 'https://download.pytorch.org/whl/')"
-    printf "%5d / $count                   $d/$p/ => $d/simple/$p/ $pcount\n" $i
-    checkCount $d/$p $count 1
-    cd ..
-  done
-  echo
-  cd "$dir"
-}
-
+# Moved checkCount to the top so subshells can access it
 function checkCount() {
   local content="$1"
   local count="$2"
@@ -53,6 +14,39 @@ function checkCount() {
     echo "!!! failing because low packages count for $content: $count (probably intermittent download failure)"
     exit 1
   fi
+}
+
+function updateIndex() {
+  local d=$1
+
+  # Wrapped in a subshell (...) so parallel executions don't conflict with 'cd' commands
+  (
+    mkdir -p $d/simple
+    cd $d/simple
+
+    curl -s https://download.pytorch.org/$d/ | grep -v 'TIMESTAMP 1' > index.html
+    local count="$(cat index.html | cut -d '>' -f 2 | cut -d '<' -f 1 | grep -cve '^\s*$')"
+
+    echo "Fetching https://download.pytorch.org/$d/ => $d/simple/"
+    checkCount $d $count 40
+
+    local i=0
+    for p in `cat index.html | cut -d '>' -f 2 | cut -d '<' -f 1`
+    do
+      mkdir -p $p
+      cd $p
+      ((i++))
+      curl -s https://download.pytorch.org/$d/$p/ \
+        | sed -e 's_href="/whl_href="https://download.pytorch.org/whl_' \
+        | grep -v 'TIMESTAMP 1' \
+        > index.html
+
+      local pcount="$(cat index.html | grep -c 'https://download.pytorch.org/whl/')"
+      checkCount $d/$p $pcount 1
+      cd ..
+    done
+    echo "✅ Completed $d"
+  )
 }
 
 function updateHumanIndexes() {
@@ -100,33 +94,38 @@ EOF
   done
 }
 
-# update main PyTorch index, that contains everything, whatever the compute platform
+# 1. Update main PyTorch index (Sequentially, to check if we even need to continue)
 updateIndex "whl"
 updateIndex "whl/nightly"
 
-# see resulting updates
 git update-index -q --refresh
-git diff-index --name-status HEAD
 
-if `git diff-index --quiet HEAD`
-then
+if git diff-index --quiet HEAD; then
   echo "no update found in PyTorch main index."
   updateHumanIndexes
   exit 0
 fi
-echo "updates found in PyTorch main index: updating also compute platform specific ones..."
 
-# dynamically fetch all compute platforms from PyTorch root index
-echo "Discovering compute platforms..."
-DYNAMIC_VERSIONS=$(curl -sS https://download.pytorch.org/whl/ | grep -Eo 'href="(cu[0-9]+|cpu[a-z0-9_-]*|xpu|rocm[0-9.]+)/?"' | cut -d'"' -f2 | tr -d '/' | sort -u)
+echo "Updates found in PyTorch main index. Updating platforms in parallel..."
 
+# 2. Dynamically fetch platforms
+DYNAMIC_VERSIONS=$(curl -sS https://download.pytorch.org/whl/ | grep -Eo 'href="(cu[0-9]+|cpu|xpu|rocm[0-9.]+)/?"' | cut -d'"' -f2 | tr -d '/' | sort -u)
 echo "Platforms found: $DYNAMIC_VERSIONS"
 
-# loop through the dynamically discovered platforms instead of the hardcoded list
+# 3. PARALLEL EXECUTION: Launch all platforms concurrently
+PIDS=()
 for d in $DYNAMIC_VERSIONS
 do
-  updateIndex "whl/$d"
+  # The '&' runs the function in the background
+  updateIndex "whl/$d" & 
+  PIDS+=($!) # Save the process ID to track it
 done
+
+# 4. Wait for all background jobs to finish and ensure none failed
+for pid in "${PIDS[@]}"; do
+  wait $pid || { echo "!!! A parallel download job failed. Exiting."; exit 1; }
+done
+
 updateHumanIndexes
 
 du -sh whl/*
